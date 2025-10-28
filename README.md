@@ -33,6 +33,32 @@ U2FsdGVkX18K6lJUa/L9BA3PQYRjEJqTJExPRId90HCWm-l7hOs7gl0eoAU5-1fMh4l9Yy5QcdXuksBZ
 
 The `tr` command is present to convert the base64 encoding to base64url encoding that can be embedded in a URL.
 
+### Accompanying configuration
+
+The `openssl` command shown above would yield the following Apache configuration directives:
+
+```
+<Location /account/initial-password/>
+    AuthType Basic
+    AuthBasicProvider hpc-acct
+    AuthName "UD-HPC Initial Password Reset"
+
+    AuthnHPCAcctEnable On
+    AuthnHPCAcctEncryptMethod aes_256_cbc sha256
+    AuthnHPCAcctEncryptIterCount 1000
+    AuthnHPCAcctUsePBKDF2 On
+    AuthnHPCAcctEncryptPassword "this is my passw0rd"
+</Location>
+```
+
+The module uses the path associated with the enclosing location as its base URI path; this could be made explicit by adding
+
+```
+    AuthnHPCAcctBaseUriPath "/account/initial-password"
+```
+
+to the directives.
+
 ## Authentication
 
 The module implements authentication of the encrypted identity token by hooking into the request-processing pipeline once the URI has been decoded and mapped — and before any authentication/authorization has happened.  If the requested URI is rooted under the directory/location at which the module is configured and enabled, then the *first path component of the URI fragment* is taken to be the base64url-encoded encrypted identity token.  That token is paired with a random username constructed at server startup and a basic **Authorization** header synthesized and added to the request headers.
