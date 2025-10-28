@@ -579,6 +579,11 @@ static openssl_digest_fn authn_hpc_acct_encmethod_digest_funcs[] = {
  */
 typedef struct {
     /**
+     * @var     is_enabled
+     * @brief   Boolean that is set when this module is enabled on a directory/location
+     */
+    int                             is_enabled;
+    /**
      * @var     uid_header_name
      * @brief   Request header to which token uid is assigned
      * @details If this field is NULL or an empty C string, no assignment will be made.
@@ -879,6 +884,8 @@ set_base_uri_path(
  * @brief   Apache configuration commands for this module
  */
 static const command_rec authn_hpc_acct_cmds[] = {
+        AP_INIT_FLAG("AuthnHPCAcctEnable", ap_set_flag_slot, (void*)APR_OFFSETOF(authn_hpc_acct_config_t, is_enabled), OR_AUTHCFG,
+                        "Set to 'on' to use this module to authenticate on this path"),
         AP_INIT_TAKE1("AuthnHPCAcctSetUidHeader", ap_set_string_slot, (void*)APR_OFFSETOF(authn_hpc_acct_config_t, uid_header_name), OR_AUTHCFG,
                         "Request header that should be set to the uid from the identity token (default: " AUTHN_HPC_DEFAULT_UID_HEADER_STR),
         AP_INIT_TAKE1("AuthnHPCAcctSetUidNumberHeader", ap_set_string_slot, (void*)APR_OFFSETOF(authn_hpc_acct_config_t, uid_number_header_name), OR_AUTHCFG,
@@ -1019,48 +1026,51 @@ authn_hpc_acct_header_parser(
     authn_hpc_acct_config_t     *conf =
         (authn_hpc_acct_config_t*)ap_get_module_config(r->per_dir_config, &authn_hpc_acct_module);
     
-    const char                  *uri_path = r->uri, *uri_path_end, *authorization_header = NULL;
-    struct iovec                components[3];
-    apr_size_t                  slen;
-    
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct header_parser: '%s' exists under '%s' ??", uri_path, (conf->base_uri_path ? conf->base_uri_path : "/"));
-    
-    /* Does the request URI start with the base?  If so, drop that off the URI: */
-    if ( conf->base_uri_path_len == 0 ) {
-        /* Implied root path, just drop the leading slash: */
-        if ( ! *uri_path || (*uri_path != '/') ) return DECLINED;
-        uri_path++;        
-    } else if ( (strncmp(uri_path, conf->base_uri_path, conf->base_uri_path_len) == 0 ) && (uri_path[conf->base_uri_path_len] == '/') ) {
-        uri_path += conf->base_uri_path_len + 1;
-    } else {
-        return DECLINED;
+    if ( conf->is_enabled ) {
+        const char                  *uri_path = r->uri, *uri_path_end, *authorization_header = NULL;
+        struct iovec                components[3];
+        apr_size_t                  slen;
+        
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct header_parser: '%s' exists under '%s' ??", uri_path, (conf->base_uri_path ? conf->base_uri_path : "/"));
+        
+        /* Does the request URI start with the base?  If so, drop that off the URI: */
+        if ( conf->base_uri_path_len == 0 ) {
+            /* Implied root path, just drop the leading slash: */
+            if ( ! *uri_path || (*uri_path != '/') ) return DECLINED;
+            uri_path++;        
+        } else if ( (strncmp(uri_path, conf->base_uri_path, conf->base_uri_path_len) == 0 ) && (uri_path[conf->base_uri_path_len] == '/') ) {
+            uri_path += conf->base_uri_path_len + 1;
+        } else {
+            return DECLINED;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct header_parser: request URI '%s' matches at '%s'", r->uri, uri_path);
+                      
+        /*
+         * The base64url-encoded identity token should be the next component of the URI:
+         */
+        uri_path_end = uri_path;
+        while ( *uri_path_end && (*uri_path_end != '/') ) uri_path_end++;
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct header_parser: isolated %ld characters at '%s'", uri_path_end - uri_path, uri_path);
+        
+        /*
+         * Manufacture the Authorization header:
+         */
+        components[0].iov_base = (void*)authn_hpc_acct_our_username, components[0].iov_len = authn_hpc_acct_our_username_len;
+        components[1].iov_base = (void*)":", components[1].iov_len = 1;
+        components[2].iov_base = (void*)uri_path, components[2].iov_len = uri_path_end - uri_path;
+        authorization_header = apr_pstrcatv(r->pool, components, 3, &slen);
+        authorization_header = apr_pencode_base64(r->pool, authorization_header, slen, APR_ENCODE_NOPADDING, NULL);
+        authorization_header = apr_pstrcat(r->pool, "Basic ", authorization_header, NULL);
+        apr_table_set(r->headers_in, "Authorization", authorization_header);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct header_parser: set Authorization header '%s'", authorization_header);
+        
+        return OK;
     }
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct header_parser: request URI '%s' matches at '%s'", r->uri, uri_path);
-                  
-    /*
-     * The base64url-encoded identity token should be the next component of the URI:
-     */
-    uri_path_end = uri_path;
-    while ( *uri_path_end && (*uri_path_end != '/') ) uri_path_end++;
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct header_parser: isolated %ld characters at '%s'", uri_path_end - uri_path, uri_path);
-    
-    /*
-     * Manufacture the Authorization header:
-     */
-    components[0].iov_base = (void*)authn_hpc_acct_our_username, components[0].iov_len = authn_hpc_acct_our_username_len;
-    components[1].iov_base = (void*)":", components[1].iov_len = 1;
-    components[2].iov_base = (void*)uri_path, components[2].iov_len = uri_path_end - uri_path;
-    authorization_header = apr_pstrcatv(r->pool, components, 3, &slen);
-    authorization_header = apr_pencode_base64(r->pool, authorization_header, slen, APR_ENCODE_NOPADDING, NULL);
-    authorization_header = apr_pstrcat(r->pool, "Basic ", authorization_header, NULL);
-    apr_table_set(r->headers_in, "Authorization", authorization_header);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct header_parser: set Authorization header '%s'", authorization_header);
-    
-    return OK;
+    return DECLINED;
 }
 
 /**
@@ -1085,166 +1095,171 @@ authn_hpc_acct_check_password(
     authn_hpc_acct_config_t     *conf =
         (authn_hpc_acct_config_t*)ap_get_module_config(r->per_dir_config, &authn_hpc_acct_module);
     
-    EVP_CIPHER_CTX              *ctx = NULL;
-    const EVP_CIPHER            *cipher = NULL;
-    unsigned char               *payload = NULL, salt[8], *salt_ptr = NULL,
-                                *key = NULL, *iv = NULL, *decrypt = NULL;
-    apr_size_t                  payload_len;
-    int                         len, decrypt_len, int_payload_len, rc;
-    
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct authenticate: try to authenticate '%s' with password '%s'", user, password);
-                  
-    /*
-     * Our post-read hook should have filled-in the username with our secret
-     * randomized-at-runtime string and deposited the encrypted token in the
-     * password field.
-     */
-    if ( ! authn_hpc_acct_our_username ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01003)
-                      "authn_hpc_acct authenticate: no randomized username configured in runtime");
-        return AUTH_GENERAL_ERROR;
-    }
-    if ( strcmp(user, authn_hpc_acct_our_username) != 0 ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01004)
-                      "authn_hpc_acct authenticate: incorrect username in request");
-        return AUTH_DENIED;
-    }
-    
-    /*
-     * The password field is the encrypted identity token, so let's decode
-     * it first.  If we're running an older APR library, the base64url to base64
-     * conversion needs to be handled first:
-     */
-    DO_AUTHN_HPC_BASE64URL_FIXUP((char*)password);
-    payload = (unsigned char*)apr_pdecode_base64_binary(r->pool, password, APR_ENCODE_STRING, APR_ENCODE_NONE, &payload_len);
-    if ( ! payload || ! payload_len ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                      APLOGNO(01005) "authn_hpc_acct authenticate: empty identity token");
-        return AUTH_GENERAL_ERROR;
-    }
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct authenticate: base64 decode of password yielded %ld bytes", payload_len);
-    
-    /*
-     * Now prepare for decryption.  First, pull a salt off the front of
-     * the payload if present:
-     */
-    if ( strncmp((const char*)payload, "Salted__", 8) == 0 ) {
-        char        salt_str[17];
+    if ( conf->is_enabled ) {
+        EVP_CIPHER_CTX              *ctx = NULL;
+        const EVP_CIPHER            *cipher = NULL;
+        unsigned char               *payload = NULL, salt[8], *salt_ptr = NULL,
+                                    *key = NULL, *iv = NULL, *decrypt = NULL;
+        apr_size_t                  payload_len;
+        int                         len, decrypt_len, int_payload_len, rc;
         
-        memcpy(salt, payload + 8, 8);
-        salt_ptr = salt;
-        snprintf(salt_str, sizeof(salt_str), "%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX", salt[0], salt[1], salt[2], salt[3], salt[4], salt[5], salt[6], salt[7]);
-        payload += 16;
-        payload_len -= 16;
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                      "authn_hpc_acct authenticate: 8-byte salt %s extracted from payload leaving %ld bytes", salt_str, payload_len);
-    }
-    if ( payload_len > INT_MAX ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                      APLOGNO(01006) "authn_hpc_acct authenticate: payload is too large");
-        return AUTH_GENERAL_ERROR;
-    }
-    int_payload_len = payload_len;
-    
-    /*
-     * Now generate the key:
-     */
-    if ( (rc = authn_hpc_acct_generate_key(r, conf, salt_ptr, &key, &iv)) ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                      APLOGNO(01007) "authn_hpc_acct authenticate: unable to generate key for request");
-        return AUTH_GENERAL_ERROR;
-    }
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct authenticate: decryption key generated");
-    
-    /*
-     * Key and initvec are ready, decrypt the payload:
-     */
-    decrypt = apr_pcalloc(r->pool, payload_len + 1);
-    if ( ! decrypt ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                      APLOGNO(01008) "authn_hpc_acct authenticate: unable to allocate decrypt buffer");
-        return AUTH_GENERAL_ERROR;
-    }
-    decrypt_len = payload_len + 1;
-    
-    ctx = EVP_CIPHER_CTX_new();
-    if ( ! ctx ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                      APLOGNO(01009) "authn_hpc_acct authenticate: unable to allocate decrypt context");
-        return AUTH_GENERAL_ERROR;
-    }
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct authenticate: decryption context ready");
-    
-    cipher = (authn_hpc_acct_encmethod_cipher_funcs[conf->enc_method.cipher])();
-    rc = EVP_DecryptInit_ex(ctx, cipher, NULL, key, iv);
-    if ( rc != 1 ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                      APLOGNO(01010) "authn_hpc_acct authenticate: unable to initialize decrypt context");
-        EVP_CIPHER_CTX_free(ctx);
-        return AUTH_GENERAL_ERROR;
-    }
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct authenticate: key/iv initialized, ready for decrypt");
-    
-    rc = EVP_DecryptUpdate(ctx, decrypt, &decrypt_len, payload, int_payload_len);
-    if ( rc != 1 ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                      APLOGNO(01011) "authn_hpc_acct authenticate: unable to decrypt");
-        EVP_CIPHER_CTX_free(ctx);
-        return AUTH_DENIED;
-    }
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct authenticate: payload body decrypted (%d bytes): %c%c%c%c...", decrypt_len, decrypt[0], decrypt[1], decrypt[2], decrypt[3]);
-                  
-    rc = EVP_DecryptFinal_ex(ctx, decrypt + decrypt_len, &len);
-    if ( rc != 1 ) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                      APLOGNO(01012) "authn_hpc_acct authenticate: unable to complete decrypt");
-        EVP_CIPHER_CTX_free(ctx);
-        return AUTH_DENIED;
-    }
-    decrypt_len += len;
-    decrypt[decrypt_len] = '\0';
-    EVP_CIPHER_CTX_free(ctx);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                  "authn_hpc_acct authenticate: payload decryption complete: '%s'", decrypt);
-    
-    /* We successfully decrypted the identity token, hooray! */
-    if ( decrypt_len > 0 ) {
-        authn_hpc_id_token_t    the_token;
+                      "authn_hpc_acct authenticate: try to authenticate '%s' with password '%s'", user, password);
+                      
+        /*
+         * Our post-read hook should have filled-in the username with our secret
+         * randomized-at-runtime string and deposited the encrypted token in the
+         * password field.
+         */
+        if ( ! authn_hpc_acct_our_username ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01003)
+                          "authn_hpc_acct authenticate: no randomized username configured in runtime");
+            return AUTH_GENERAL_ERROR;
+        }
+        if ( strcmp(user, authn_hpc_acct_our_username) != 0 ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01004)
+                          "authn_hpc_acct authenticate: incorrect username in request");
+            return AUTH_DENIED;
+        }
         
-        if ( authn_hpc_id_token_parse(r, (char*)decrypt, &the_token) == 0 ) {
-            /* Expired? */
-            if ( the_token.expiration > apr_time_now() ) {
-                /* Overwrite the authorized username field: */
-                r->user = (char*)the_token.uid;
-                
-                /* Add the headers: */
-                if ( conf->uid_header_name && *conf->uid_header_name ) apr_table_set(r->headers_in, conf->uid_header_name, the_token.uid);
-                if ( conf->uid_number_header_name && *conf->uid_number_header_name ) apr_table_set(r->headers_in, conf->uid_number_header_name, the_token.uid_number);
-                if ( conf->ldap_dn_header_name && *conf->ldap_dn_header_name ) apr_table_set(r->headers_in, conf->ldap_dn_header_name, the_token.ldap_dn);
-                
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                              "authn_hpc_acct authenticate: accepting %s (%s) with dn=%s",
-                              the_token.uid, the_token.uid_number, the_token.ldap_dn);
-                return AUTH_GRANTED;
+        /*
+         * The password field is the encrypted identity token, so let's decode
+         * it first.  If we're running an older APR library, the base64url to base64
+         * conversion needs to be handled first:
+         */
+        DO_AUTHN_HPC_BASE64URL_FIXUP((char*)password);
+        payload = (unsigned char*)apr_pdecode_base64_binary(r->pool, password, APR_ENCODE_STRING, APR_ENCODE_NONE, &payload_len);
+        if ( ! payload || ! payload_len ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          APLOGNO(01005) "authn_hpc_acct authenticate: empty identity token");
+            return AUTH_GENERAL_ERROR;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct authenticate: base64 decode of password yielded %ld bytes", payload_len);
+        
+        /*
+         * Now prepare for decryption.  First, pull a salt off the front of
+         * the payload if present:
+         */
+        if ( strncmp((const char*)payload, "Salted__", 8) == 0 ) {
+            char        salt_str[17];
+            
+            memcpy(salt, payload + 8, 8);
+            salt_ptr = salt;
+            snprintf(salt_str, sizeof(salt_str), "%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX", salt[0], salt[1], salt[2], salt[3], salt[4], salt[5], salt[6], salt[7]);
+            payload += 16;
+            payload_len -= 16;
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                          "authn_hpc_acct authenticate: 8-byte salt %s extracted from payload leaving %ld bytes", salt_str, payload_len);
+        }
+        if ( payload_len > INT_MAX ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          APLOGNO(01006) "authn_hpc_acct authenticate: payload is too large");
+            return AUTH_GENERAL_ERROR;
+        }
+        int_payload_len = payload_len;
+        
+        /*
+         * Now generate the key:
+         */
+        if ( (rc = authn_hpc_acct_generate_key(r, conf, salt_ptr, &key, &iv)) ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
+                          APLOGNO(01007) "authn_hpc_acct authenticate: unable to generate key for request");
+            return AUTH_GENERAL_ERROR;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct authenticate: decryption key generated");
+        
+        /*
+         * Key and initvec are ready, decrypt the payload:
+         */
+        decrypt = apr_pcalloc(r->pool, payload_len + 1);
+        if ( ! decrypt ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
+                          APLOGNO(01008) "authn_hpc_acct authenticate: unable to allocate decrypt buffer");
+            return AUTH_GENERAL_ERROR;
+        }
+        decrypt_len = payload_len + 1;
+        
+        ctx = EVP_CIPHER_CTX_new();
+        if ( ! ctx ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
+                          APLOGNO(01009) "authn_hpc_acct authenticate: unable to allocate decrypt context");
+            return AUTH_GENERAL_ERROR;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct authenticate: decryption context ready");
+        
+        cipher = (authn_hpc_acct_encmethod_cipher_funcs[conf->enc_method.cipher])();
+        rc = EVP_DecryptInit_ex(ctx, cipher, NULL, key, iv);
+        if ( rc != 1 ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
+                          APLOGNO(01010) "authn_hpc_acct authenticate: unable to initialize decrypt context");
+            EVP_CIPHER_CTX_free(ctx);
+            return AUTH_GENERAL_ERROR;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct authenticate: key/iv initialized, ready for decrypt");
+        
+        rc = EVP_DecryptUpdate(ctx, decrypt, &decrypt_len, payload, int_payload_len);
+        if ( rc != 1 ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
+                          APLOGNO(01011) "authn_hpc_acct authenticate: unable to decrypt");
+            EVP_CIPHER_CTX_free(ctx);
+            return AUTH_DENIED;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct authenticate: payload body decrypted (%d bytes): %c%c%c%c...", decrypt_len, decrypt[0], decrypt[1], decrypt[2], decrypt[3]);
+                      
+        rc = EVP_DecryptFinal_ex(ctx, decrypt + decrypt_len, &len);
+        if ( rc != 1 ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
+                          APLOGNO(01012) "authn_hpc_acct authenticate: unable to complete decrypt");
+            EVP_CIPHER_CTX_free(ctx);
+            return AUTH_DENIED;
+        }
+        decrypt_len += len;
+        decrypt[decrypt_len] = '\0';
+        EVP_CIPHER_CTX_free(ctx);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct authenticate: payload decryption complete: '%s'", decrypt);
+        
+        /* We successfully decrypted the identity token, hooray! */
+        if ( decrypt_len > 0 ) {
+            authn_hpc_id_token_t    the_token;
+            
+            if ( authn_hpc_id_token_parse(r, (char*)decrypt, &the_token) == 0 ) {
+                /* Expired? */
+                if ( the_token.expiration > apr_time_now() ) {
+                    /* Overwrite the authorized username field: */
+                    r->user = (char*)the_token.uid;
+                    
+                    /* Add the headers: */
+                    if ( conf->uid_header_name && *conf->uid_header_name ) apr_table_set(r->headers_in, conf->uid_header_name, the_token.uid);
+                    if ( conf->uid_number_header_name && *conf->uid_number_header_name ) apr_table_set(r->headers_in, conf->uid_number_header_name, the_token.uid_number);
+                    if ( conf->ldap_dn_header_name && *conf->ldap_dn_header_name ) apr_table_set(r->headers_in, conf->ldap_dn_header_name, the_token.ldap_dn);
+                    
+                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                                  "authn_hpc_acct authenticate: accepting %s (%s) with dn=%s",
+                                  the_token.uid, the_token.uid_number, the_token.ldap_dn);
+                    return AUTH_GRANTED;
+                } else {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
+                                  APLOGNO(01013) "authn_hpc_acct authenticate: identity token has expired: %s %ld vs. %ld", decrypt, the_token.expiration, apr_time_now());
+                }
             } else {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                              APLOGNO(01013) "authn_hpc_acct authenticate: identity token has expired: %s %ld vs. %ld", decrypt, the_token.expiration, apr_time_now());
+                              APLOGNO(01014) "authn_hpc_acct authenticate: unable to parse the identity token: %s", decrypt);
             }
         } else {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
-                          APLOGNO(01014) "authn_hpc_acct authenticate: unable to parse the identity token: %s", decrypt);
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          APLOGNO(01005) "authn_hpc_acct authenticate: empty identity token");
         }
-    } else {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                      APLOGNO(01005) "authn_hpc_acct authenticate: empty identity token");
+        return AUTH_DENIED;
     }
-    return AUTH_DENIED;
+    
+    /* We don't have any opinion on this user: */
+    return AUTH_USER_NOT_FOUND;
 }
 
 /**
