@@ -27,8 +27,8 @@ salt=0AEA52546BF2FD04
 key=E4FCB78C122316D6F16B8C87112A95E1929B48358EEFEC84065C6393B0416A47
 iv =E52D1B367E1CFF6972DFEEE575A545F9
 
-[PROMPT]$ cat token.enc | tr '+/' '-/'
-U2FsdGVkX18K6lJUa/L9BA3PQYRjEJqTJExPRId90HCWm-l7hOs7gl0eoAU5-1fMh4l9Yy5QcdXuksBZai2INOJoPilH70g5RZMYSeuiqpsiZ4i4t1zZuNQi6QuC1FOs
+[PROMPT]$ cat token.enc | tr '+/' '-_'
+U2FsdGVkX18K6lJUa_L9BA3PQYRjEJqTJExPRId90HCWm-l7hOs7gl0eoAU5-1fMh4l9Yy5QcdXuksBZai2INOJoPilH70g5RZMYSeuiqpsiZ4i4t1zZuNQi6QuC1FOs
 ```
 
 The `tr` command is present to convert the base64 encoding to base64url encoding that can be embedded in a URL.
