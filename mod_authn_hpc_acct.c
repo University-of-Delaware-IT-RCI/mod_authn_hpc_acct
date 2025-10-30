@@ -34,6 +34,13 @@
 
 #include "openssl/evp.h"
 
+#ifndef MAX_PASSWORD_SIZE
+/**
+ * @def     MAX_PASSWORD_SIZE
+ * @brief   Maximum allowed size of encryption passwords
+ */
+#define MAX_PASSWORD_SIZE   128 /* bytes */
+#endif
 
 /*
  * Forward-declare the module:
@@ -632,7 +639,7 @@ typedef struct {
     /**
      * @var     should_use_PBKDF2
      * @brief   Should the key be generated using PBKDF2 or not?
-     * @details A non-zero value implies yes/true; defaults to no/false
+     * @details A non-zero value implies yes/true; defaults to yes/true
      */
     int                             should_use_PBKDF2;
     /**
@@ -679,6 +686,7 @@ create_authn_hpc_acct_dir_config(
     conf->password_len = -1;
     conf->iter_count = AUTHN_HPC_ACCT_DEFAULT_ITER_COUNT;
     conf->enc_method = AUTHN_HPC_ACCT_DEFAULT_ENC_METHOD;
+    conf->should_use_PBKDF2 = 1;
     
     /* Default to using "d" as the base URI path (sans trailing "/" chars): */
     if ( d && (*d == '/') ) {
@@ -768,6 +776,56 @@ set_enc_iter_count(
     return NULL;
 }
 
+
+#define AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT   1
+#define AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64 2
+#define AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES  3
+
+static const char*
+__set_enc_password(
+    cmd_parms               *cmd,
+    authn_hpc_acct_config_t *conf,
+    int                     type,
+    const unsigned char     *bytes,
+    size_t                  bytes_len
+)
+{
+    if ( (! bytes) ||
+         ((type != AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES) && !*bytes) ||
+         (bytes_len == 0) )
+    {
+        return "AuthnHPCAcctEncryptPassword: empty password not allowed";
+    }
+    switch ( type ) {
+        case AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT: {
+            conf->password = bytes;
+            conf->password_len = (bytes_len < 0) ? strlen((char*)bytes) : bytes_len;
+            break;
+        }
+        case AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64: {
+            conf->password = apr_pdecode_base64_binary(
+                                    cmd->pool,
+                                    (const char*)bytes,
+                                    (bytes_len < 0) ? APR_ENCODE_STRING : bytes_len,
+                                    APR_ENCODE_NONE,
+                                    &conf->password_len);
+            if ( ! conf->password || ! conf->password_len ) {
+                return "AuthnHPCAcctEncryptPassword: invalid base64url-encoded password";
+            }
+            break;
+        }
+        case AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES: {
+            conf->password = bytes;
+            conf->password_len = bytes_len;
+            break;
+        }
+        default: {
+            return "AuthnHPCAcctEncryptPassword: something very weird happened...";
+        }
+    }
+    return NULL;
+}
+
 /**
  * @brief   Apache configuration callback that handles AuthnHPCAcctEncryptPassword
  *
@@ -788,8 +846,6 @@ set_enc_password(
     const char  *arg2
 )
 {
-#define AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT   1
-#define AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64 2
 
     authn_hpc_acct_config_t     *conf = (authn_hpc_acct_config_t*)_conf;
     int                         password_type;
@@ -813,29 +869,103 @@ set_enc_password(
         password_type = AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT;
         password = arg1;
     }
-    if ( ! password || ! *password ) return "AuthnHPCAcctEncryptPassword: empty password not allowed";
-    switch ( password_type ) {
-        case AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT: {
-            conf->password = (unsigned char*)password;
-            conf->password_len = strlen(password);
-            break;
-        }
-        case AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64: {
-            conf->password = apr_pdecode_base64_binary(cmd->pool, password, APR_ENCODE_STRING, APR_ENCODE_NONE, &conf->password_len);
-            break;
-        }
-        default: {
-            return "AuthnHPCAcctEncryptPassword: something very weird happened...";
-        }
-    }
-    if ( ! conf->password || ! conf->password_len ) {
-        return apr_pstrcat(cmd->pool, "AuthnHPCAcctEncryptPassword: invalid base64url-encoded password '", password, "'", NULL);
-    }
-    return NULL;
+    return __set_enc_password(cmd, conf, password_type, (const unsigned char*)password, -1);
+}
+
+static const char*
+set_enc_password_file(
+    cmd_parms   *cmd,
+    void        *_conf,
+    const char  *arg1,
+    const char  *arg2
+)
+{
+    const char      *password_file;
+    int             password_type;
+    apr_file_t      *fp;
+    apr_finfo_t     finfo;
+    unsigned char   *file_contents;
+    apr_off_t       offset;
+    apr_size_t      file_contents_len, read_len;
     
+    /* If we were given two strings, the first MUST be a valid type: */
+    if ( arg1 && *arg1 && arg2 && *arg2 ) {
+        if ( strcasecmp(arg1, "base64") == 0 ) {
+            password_type = AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64;
+            password_file = arg2;
+        }
+        else if (strcasecmp(arg1, "text") == 0 ) {
+            password_type = AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT;
+            password_file = arg2;
+        }
+        else if (strcasecmp(arg1, "bytes") == 0 ) {
+            password_type = AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES;
+            password_file = arg2;
+        }
+        else {
+            return apr_pstrcat(cmd->pool, "AuthnHPCAcctEncryptPassword: invalid password type: '", arg1, "'", NULL);
+        }
+    } else {
+        /* Assume it's bytes: */
+        password_type = AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES;
+        password_file = arg1;
+    }
+    
+    /* Attempt to open the file: */
+    if ( apr_file_open(&fp, password_file, APR_READ|APR_BINARY, 0, cmd->pool) != APR_SUCCESS) {
+        return apr_pstrcat(cmd->pool, "Cannot open file ", password_file, NULL);
+    }
+    
+    /* How large? */
+    apr_file_info_get(&finfo, APR_FINFO_SIZE, fp);
+    if (finfo.size > MAX_PASSWORD_SIZE) {
+        apr_file_close(fp);
+        return apr_pstrcat(cmd->pool, "Password file ", password_file, " too large", NULL);
+    }
+    if (finfo.size <= 0) {
+        apr_file_close(fp);
+        return apr_pstrcat(cmd->pool, "Password file ", password_file, " is empty", NULL);
+    }
+    file_contents_len = finfo.size;
+    file_contents = apr_pcalloc(cmd->pool, sizeof(char) * file_contents_len);
+    if ( ! file_contents ) {
+        apr_file_close(fp);
+        return "Unable to allocate password buffer.";
+    }
+    offset = 0;
+    read_len = file_contents_len;
+    apr_file_seek(fp, APR_SET, &offset);
+    if ( apr_file_read(fp, file_contents, &read_len) != APR_SUCCESS ) {
+        apr_file_close(fp);
+        return apr_pstrcat(cmd->pool, "Failed to read from password file ", password_file, NULL);
+    }
+    apr_file_close(fp);
+    
+    /* Any special processing based on type: */
+    switch ( password_type ) {
+        case AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT:
+        case AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64: {
+            /* Strip-out any leading whitespace: */
+            while ( read_len && isspace(*file_contents) ) file_contents++, read_len--;
+            
+            /* Strip-out any training whitespace: */
+            while ( read_len && isspace(file_contents[read_len - 1]) ) file_contents[read_len - 1] = '\0', read_len--;
+        }
+        case AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES:
+            break;
+    }
+    
+    return __set_enc_password(
+                cmd,
+                (authn_hpc_acct_config_t*)_conf,
+                password_type,
+                file_contents,
+                read_len);
+}
+
 #undef AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT
 #undef AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64
-}
+#undef AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES
 
 /**
  * @brief   Apache configuration callback that handles AuthnHPCAcctEncryptBaseUriPath
@@ -895,13 +1025,15 @@ static const command_rec authn_hpc_acct_cmds[] = {
         AP_INIT_TAKE2("AuthnHPCAcctEncryptMethod", set_enc_method, NULL, OR_AUTHCFG,
                         "Encryption algorithm as <cipher> <digest>"),
         AP_INIT_TAKE1("AuthnHPCAcctEncryptIterCount", set_enc_iter_count, NULL, OR_AUTHCFG,
-                        "Encryption iteraction count"),
+                        "Encryption iteration count"),
         AP_INIT_TAKE12("AuthnHPCAcctEncryptPassword", set_enc_password, NULL, OR_AUTHCFG,
                         "Encryption password type and value, where type is 'base64' or 'text' (default 'text')"),
+        AP_INIT_TAKE12("AuthnHPCAcctEncryptPasswordFile", set_enc_password_file, NULL, OR_AUTHCFG,
+                        "Read an encryption password from this file path, with optional type 'base64' or 'text' as first argument"),
         AP_INIT_TAKE1("AuthnHPCAcctBaseUriPath", set_base_uri_path, NULL, OR_AUTHCFG,
                         "Base URI path after which the identity token occurs"),
         AP_INIT_FLAG("AuthnHPCAcctUsePBKDF2", ap_set_flag_slot, (void*)APR_OFFSETOF(authn_hpc_acct_config_t, should_use_PBKDF2), OR_AUTHCFG,
-                        "Set to 'on' to use PBKDF2 key generation"),
+                        "Set to 'off' to disable PBKDF2 key generation"),
         {NULL}
     };
 
