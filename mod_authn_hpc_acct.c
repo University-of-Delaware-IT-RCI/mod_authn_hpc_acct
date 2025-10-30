@@ -656,6 +656,12 @@ typedef struct {
      * @brief   The number of characters in the @ref base_uri_path
      */
     apr_size_t                      base_uri_path_len;
+    /**
+     * @var     uri_component_skip
+     * @brief   Skip this many components in the URI fragment to find the identity
+     *          token.
+     */
+     int                            uri_component_skip;
 } authn_hpc_acct_config_t;
 
 /**
@@ -776,18 +782,43 @@ set_enc_iter_count(
     return NULL;
 }
 
-
+/**
+ * @def     AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT
+ * @brief   Type number for a textual password
+ */
 #define AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT   1
+/**
+ * @def     AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64
+ * @brief   Type number for a base64-encoded password
+ */
 #define AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64 2
+/**
+ * @def     AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES
+ * @brief   Type number for a binary password
+ */
 #define AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES  3
 
+
+/**
+ * @brief   Internal handler action shared by the two password commands
+ *
+ * @param   cmd         Info re: the configuration command that was invoked
+ * @param   conf        This module's per-directory config
+ * @param   type        The type of password handed to this function
+ * @param   bytes       Pointer to the password bytes
+ * @param   bytes_len   The number of bytes in the password; -1 implies a C string
+ *                      to which strlen() will be applied
+ *
+ * @return  Returns NULL on success, a pointer to a C string describing an error
+ *          otherwise.
+ */
 static const char*
 __set_enc_password(
     cmd_parms               *cmd,
     authn_hpc_acct_config_t *conf,
     int                     type,
     const unsigned char     *bytes,
-    size_t                  bytes_len
+    int                     bytes_len
 )
 {
     if ( (! bytes) ||
@@ -872,6 +903,19 @@ set_enc_password(
     return __set_enc_password(cmd, conf, password_type, (const unsigned char*)password, -1);
 }
 
+/**
+ * @brief   Apache configuration callback that handles AuthnHPCAcctEncryptPasswordFile
+ *
+ * @param   cmd     Info re: the configuration command that was invoked
+ * @param   _conf   Opaque pointer to the authn_hpc_acct_config_t that's been allocated
+ *                  for this location/directory
+ * @param   arg1    The password type OR the file path.  Valid types are 'base64', 'text',
+ *                  or 'bytes'
+ * @param   arg2    If @a arg1 is a type, then this holds the file path
+ *
+ * @return  Returns NULL on success, a pointer to a C string describing an error
+ *          otherwise.
+ */
 static const char*
 set_enc_password_file(
     cmd_parms   *cmd,
@@ -963,6 +1007,9 @@ set_enc_password_file(
                 read_len);
 }
 
+/* 
+ * We don't need these defined beyond this point:
+ */
 #undef AUTHN_HPC_ACCT_PASSWORD_TYPE_TEXT
 #undef AUTHN_HPC_ACCT_PASSWORD_TYPE_BASE64
 #undef AUTHN_HPC_ACCT_PASSWORD_TYPE_BYTES
@@ -1008,6 +1055,38 @@ set_base_uri_path(
     return NULL;
 }
 
+/**
+ * @brief   Apache configuration callback that handles AuthnHPCAcctUriComponentSkip
+ *
+ * @param   cmd     Info re: the configuration command that was invoked
+ * @param   _conf   Opaque pointer to the authn_hpc_acct_config_t that's been allocated
+ *                  for this location/directory
+ * @param   arg     The number of URI path components
+ *
+ * @return  Returns NULL on success, a pointer to a C string describing an error
+ *          otherwise.
+ */
+static const char*
+set_uri_component_skip(
+    cmd_parms   *cmd,
+    void        *_conf,
+    const char  *arg
+)
+{
+    authn_hpc_acct_config_t     *conf = (authn_hpc_acct_config_t*)_conf;
+    char                        *endp = NULL;
+    long                        n_skip = strtol(arg, &endp, 10);
+    
+    if ( (endp == arg) || *endp ) {
+        return apr_pstrcat(cmd->pool, "AuthnHPCAcctUriComponentSkip: not a valid integer '", arg, "'", NULL);
+    }
+    if ( (n_skip < 0) || (n_skip > INT_MAX) ) {
+        return apr_psprintf(cmd->pool, "AuthnHPCAcctUriComponentSkip: %ld not in range (0, %d)", n_skip, (int)INT_MAX);
+    }
+    conf->uri_component_skip = n_skip;
+    return NULL;
+}
+
 
 /**
  * @var     authn_hpc_acct_cmds
@@ -1034,6 +1113,8 @@ static const command_rec authn_hpc_acct_cmds[] = {
                         "Base URI path after which the identity token occurs"),
         AP_INIT_FLAG("AuthnHPCAcctUsePBKDF2", ap_set_flag_slot, (void*)APR_OFFSETOF(authn_hpc_acct_config_t, should_use_PBKDF2), OR_AUTHCFG,
                         "Set to 'off' to disable PBKDF2 key generation"),
+        AP_INIT_TAKE1("AuthnHPCAcctUriComponentSkip", set_uri_component_skip, NULL, OR_AUTHCFG,
+                        "Skip this number of leading path components in the URI fragment to locate the identity token"),
         {NULL}
     };
 
@@ -1162,6 +1243,7 @@ authn_hpc_acct_header_parser(
         const char                  *uri_path = r->uri, *uri_path_end, *authorization_header = NULL;
         struct iovec                components[3];
         apr_size_t                  slen;
+        int                         skip_count = conf->uri_component_skip;
         
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
                       "authn_hpc_acct header_parser: '%s' exists under '%s' ??", uri_path, (conf->base_uri_path ? conf->base_uri_path : "/"));
@@ -1178,7 +1260,25 @@ authn_hpc_acct_header_parser(
         }
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
                       "authn_hpc_acct header_parser: request URI '%s' matches at '%s'", r->uri, uri_path);
-                      
+        
+        /*
+         * Skip any leading components:
+         */
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "authn_hpc_acct header_parser: request URI '%s', skip %d leading components",
+                      uri_path, conf->uri_component_skip);
+        while ( skip_count ) {
+            while ( *uri_path && (*uri_path != '/') ) uri_path++;
+            if ( *uri_path == '\0' ) break;
+            uri_path++;
+            skip_count--;
+        }
+        if ( skip_count > 0 ) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                          "authn_hpc_acct header_parser: request URI '%s' does not have %d leading components",
+                          r->uri, conf->uri_component_skip);
+        }
+        
         /*
          * The base64url-encoded identity token should be the next component of the URI:
          */
