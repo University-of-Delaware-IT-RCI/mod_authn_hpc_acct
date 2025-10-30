@@ -101,6 +101,6 @@ The module implements the following Apache configuration directives:
 | `AuthnHPCAcctEncryptPassword` | Encryption password.  An optional first argument specifies the type (`base64` or `text`) and is followed by the password as a second argument; providing a single argument implied `text`.  A `text` password is used as-is while a `base64` password is first decoded. | none |
 | `AuthnHPCAcctEncryptPasswordFile` | Read the encryption password from a file.  An optional first argument specifies the type (`base64`, `text`, or `bytes`) and is followed by the file path as a second argument; providing a single argument implied `bytes`.  A `bytes` password is used as-is from the file while `text` will have leading and trailing whitespace stripped from it.  A `base64` password is stripped of whitespace and decoded. | none |
 | `AuthnHPCAcctBaseUriPath` | Override the base URI path that prefixes the identity token path component | The URI path associated with the location/directory at which the configuration is made |
-| `AuthnHPCAcctUsePBKDF2` | Set to `off` to disable PBKDF2 key generation | `off` |
+| `AuthnHPCAcctUsePBKDF2` | Set to `off` to disable PBKDF2 key generation | `on` |
 
 Either the `AuthnHPCAcctEncryptPassword` or `AuthnHPCAcctEncryptPasswordFile` must be present.
